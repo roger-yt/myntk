@@ -1,6 +1,5 @@
 import os
 import json
-import ast
 import argparse
 import logging
 import random
@@ -8,14 +7,14 @@ import torch
 import datasets
 import vllm
 from alpaca_eval import evaluate as alpaca_farm_evaluate
-from eval.utils import query_openai_chat_model, query_openai_model, generate_completions, dynamic_import_function, load_hf_lm, load_hf_tokenizer, upload_results_to_hf, check_and_upload_model_metadata
+from eval.utils import query_openai_chat_model, query_openai_model, generate_completions, dynamic_import_function, load_hf_lm, load_hf_tokenizer
 
 def main(args):
     random.seed(42)
     os.makedirs(args.save_dir, exist_ok=True)
 
     logging.info("loading data and model...")
-    alpaca_eval_data = datasets.load_dataset("tatsu-lab/alpaca_eval", "alpaca_eval", trust_remote_code=True)["eval"]
+    alpaca_eval_data = datasets.load_dataset("tatsu-lab/alpaca_eval", "alpaca_eval")["eval"]
     prompts = []
     chat_formatting_function = dynamic_import_function(args.chat_formatting_function) if args.use_chat_format else None
     for example in alpaca_eval_data:
@@ -28,7 +27,6 @@ def main(args):
                 model_name_or_path=args.model_name_or_path,
                 tokenizer_name_or_path=args.tokenizer_name_or_path,
                 use_fast_tokenizer=not args.use_slow_tokenizer,
-                revision=args.hf_revision,
             )
 
         if args.use_vllm:
@@ -37,14 +35,11 @@ def main(args):
                 tokenizer=args.tokenizer_name_or_path if args.tokenizer_name_or_path is not None else args.model_name_or_path,
                 tokenizer_mode="slow" if args.use_slow_tokenizer else "auto",
                 tensor_parallel_size=torch.cuda.device_count(),
-                tokenizer_revision=args.hf_revision,
-                revision=args.hf_revision,
             )
             
             sampling_params = vllm.SamplingParams(
                 temperature=0,  # greedy decoding
                 max_tokens=args.max_new_tokens,
-                stop=args.additional_stop_sequence,
             )
             # apply chat formatting
             if args.use_chat_format:
@@ -60,7 +55,6 @@ def main(args):
         else:
             model = load_hf_lm(
                 model_name_or_path=args.model_name_or_path,
-                revision=args.hf_revision,
                 load_in_8bit=args.load_in_8bit,
                 device_map="balanced_low_0" if torch.cuda.device_count() > 1 else "auto",
                 gptq_model=args.gptq,
@@ -87,7 +81,6 @@ def main(args):
                 do_sample=False,
                 temperature=0,
                 batch_size=args.eval_batch_size if args.eval_batch_size else 1,
-                stop_id_sequences=[tokenizer.convert_tokens_to_ids(stop) for stop in args.additional_stop_sequence],
             )
     else:
         openai_query_cache_path = os.path.join(args.save_dir, "openai_query_cache.jsonl")
@@ -116,6 +109,7 @@ def main(args):
         df_leaderboard, annotations = alpaca_farm_evaluate(
             model_outputs=model_results,
             reference_outputs=args.reference_path,
+            annotators_config="alpaca_eval_gpt4",
             output_path=args.save_dir,
             is_return_instead_of_print=True,
             caching_path=os.path.join(args.save_dir, "alpaca_eval_annotator_cache.json"),
@@ -125,6 +119,7 @@ def main(args):
     else:
         df_leaderboard, annotations = alpaca_farm_evaluate(
             model_outputs=model_results,
+            annotators_config="alpaca_eval_gpt4",
             output_path=args.save_dir,
             is_return_instead_of_print=True,
             caching_path=os.path.join(args.save_dir, "alpaca_eval_annotator_cache.json"),
@@ -137,31 +132,6 @@ def main(args):
     # save to json
     with open(os.path.join(args.save_dir, f"metrics.json"), "w") as fout:
         json.dump(df_leaderboard.to_dict(), fout)
-
-    if args.upload_to_hf is not None:
-        # upload metrics to HF. Main metric is the LC winrate
-        # we divide by 100 to match other metrics.
-        results = df_leaderboard.to_dict()
-        # copied below from alpacaeval codebase
-        is_alpaca_eval_2 = ast.literal_eval(os.environ.get("IS_ALPACA_EVAL_2", "True"))
-        if is_alpaca_eval_2:
-            task_name = "oi_alpaca_eval_2"
-            # we only have one model in here, so we can just take the first value
-            primary_score = [x for x in results["length_controlled_winrate"].values()][0] / 100
-        else:
-            task_name = "oi_alpaca_eval"
-            primary_score = [x for x in results["discrete_win_rate"].values()][0] / 100
-        upload_results_to_hf(
-            results,
-            args.upload_to_hf,
-            args.hf_upload_name,
-            task_name=task_name,
-            primary_score=primary_score,
-            prepend_timestamp=True,
-        )
-        check_and_upload_model_metadata(
-            args.model_name_or_path, args.upload_to_hf, args.hf_upload_name, hf_revision=args.hf_revision
-        )
         
 
 if __name__ == "__main__":
@@ -186,12 +156,6 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="If specified, we will load the model to generate the predictions.",
-    )
-    parser.add_argument(
-        "--hf_revision",
-        type=str,
-        default=None,
-        help="if specified, we will load the model from a revision of the model in the hub"
     )
     parser.add_argument(
         "--tokenizer_name_or_path",
@@ -247,26 +211,6 @@ if __name__ == "__main__":
         "--use_vllm",
         action="store_true",
         help="If given, we will use vLLM to generate the predictions - much faster.",
-    )
-    parser.add_argument(
-        '--additional_stop_sequence',
-        type=str,
-        nargs="+",
-        default=[],
-        help="Additional stop sequences to use when generating completions. Useful for e.g. llama-3-instruct."
-    )
-    parser.add_argument(
-        "--upload_to_hf",
-        type=str,
-        default=None,
-        help="If specified, we will upload the results to Hugging Face Datasets. "
-             "This should be the name of the dataset to upload to."
-    )
-    parser.add_argument(
-        "--hf_upload_name",
-        type=str,
-        default=None,
-        help="If uploading to hf, this is the model name"
     )
     args = parser.parse_args()
 

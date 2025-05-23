@@ -15,8 +15,6 @@ from eval.utils import (
     load_hf_lm,
     query_openai_chat_model,
     load_hf_tokenizer,
-    upload_results_to_hf,
-    check_and_upload_model_metadata,
 )
 from eval.utils import dynamic_import_function 
 
@@ -66,7 +64,6 @@ def main(args):
         prompts = []
         tokenizer = load_hf_tokenizer(
             model_name_or_path=args.model_name_or_path,
-            revision=args.hf_revision,
             tokenizer_name_or_path=args.tokenizer_name_or_path,
             use_fast_tokenizer=not args.use_slow_tokenizer,
         )
@@ -87,18 +84,11 @@ def main(args):
                 tokenizer=args.tokenizer_name_or_path if args.model_name_or_path else args.model_name_or_path,
                 tokenizer_mode="slow" if args.use_slow_tokenizer else "auto",
                 tensor_parallel_size=torch.cuda.device_count(),
-                tokenizer_revision=args.hf_revision,
-                revision=args.hf_revision,
             )
-            stop_sequences = args.additional_stop_sequence
-            # we only use stop token for non-chat format (usually applied to vanilla pretrained language models).
-            # For chat format, we will rely on the model knows when to stop.
-            if not args.use_chat_format:
-                stop_sequences.append("\n")
             sampling_params = vllm.SamplingParams(
                 temperature=0,  # greedy decoding
                 max_tokens=512,  # maximum we can pass to roberta
-                stop=stop_sequences,
+                stop=["\n"] if not args.use_chat_format else None,  # we only use stop token for non-chat format (usually applied to vanilla pretrained language models). For chat format, we will rely on the model knows when to stop.
             )
             outputs = model.generate(prompts, sampling_params)
             outputs = [it.outputs[0].text for it in outputs]
@@ -107,7 +97,6 @@ def main(args):
             print("Loading model and tokenizer for generations...")
             model = load_hf_lm(
                 model_name_or_path=args.model_name_or_path,
-                revision=args.hf_revision,
                 load_in_8bit=args.load_in_8bit,
                 device_map="balanced_low_0" if torch.cuda.device_count() > 1 else "auto",
                 gptq_model=args.gptq,
@@ -117,18 +106,13 @@ def main(args):
                 tokenizer.model_max_length = model.config.max_position_embeddings
                 print("Set tokenizer.model_max_length to model.config.max_position_embeddings: {}".format(model.config.max_position_embeddings))
             new_line_token = tokenizer.encode("\n", add_special_tokens=False)[-1]
-            stop_sequences = [[tokenizer.encode(seq, add_special_tokens=False)[-1]] for seq in args.additional_stop_sequence]
-            # we only use stop token for non-chat format (usually applied to vanilla pretrained language models).
-            # For chat format, we will rely on the model knows when to stop.
-            if not args.use_chat_format:
-                stop_sequences.append([new_line_token])
             outputs = generate_completions(
                 model=model,
                 tokenizer=tokenizer,
                 prompts=prompts,
                 max_new_tokens=512,
                 batch_size=args.eval_batch_size if args.eval_batch_size else 1,
-                stop_id_sequences=stop_sequences,  
+                stop_id_sequences=[[new_line_token]] if not args.use_chat_format else None,  # we only use stop token for non-chat format (usually applied to vanilla pretrained language models). For chat format, we will rely on the model knows when to stop.
             )
     else:
         instances = [{
@@ -185,24 +169,6 @@ def main(args):
                 print(f"Average Toxicity for {group}: {performance[group]}")
         json.dump(performance, fout, indent=4)
 
-    if args.upload_to_hf is not None:
-        # upload metrics to HF. Main metric is the accuracy
-        results = performance
-        task_name = "oi_toxigen"
-        # invert for use in leaderboard
-        primary_score = 1 - results["overall"]
-        upload_results_to_hf(
-            results,
-            args.upload_to_hf,
-            args.hf_upload_name,
-            task_name=task_name,
-            primary_score=primary_score,
-            prepend_timestamp=True,
-        )
-        check_and_upload_model_metadata(
-            args.model_name_or_path, args.upload_to_hf, args.hf_upload_name, hf_revision=args.hf_revision
-        )
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -221,12 +187,6 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="if specified, we will load the model to generate the predictions.",
-    )
-    parser.add_argument(
-        "--hf_revision",
-        type=str,
-        default=None,
-        help="if specified, we will load the model from a revision of the model in the hub"
     )
     parser.add_argument(
         "--tokenizer_name_or_path",
@@ -291,26 +251,6 @@ if __name__ == "__main__":
         type=int,
         default=500,
         help="If given, we will only use this many prompts per group. Default to 500 (half the available prompts).",
-    )
-    parser.add_argument(
-        '--additional_stop_sequence',
-        type=str,
-        nargs="+",
-        default=[],
-        help="Additional stop sequences to use when generating completions. Useful for e.g. llama-3-instruct."
-    )
-    parser.add_argument(
-        "--upload_to_hf",
-        type=str,
-        default=None,
-        help="If specified, we will upload the results to Hugging Face Datasets. "
-             "This should be the name of the dataset to upload to."
-    )
-    parser.add_argument(
-        "--hf_upload_name",
-        type=str,
-        default=None,
-        help="If uploading to hf, this is the model name"
     )
     args = parser.parse_args()
 

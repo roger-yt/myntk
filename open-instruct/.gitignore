@@ -1,21 +1,10 @@
-trash
-rejection_sampling/shards
-rejection_sampling/shards1
-token_length.png
-*.tfevents.*
-
-# for on policy preferences 
-birr/
-
-oe-eval-internal/
-
 results
 models
 wandb
 data/*
 # !data/processed
 output/
-configs/beaker_configs/auto_created
+beaker_configs/auto_created
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -146,7 +135,3 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
-
-.idea/
-.vscode
-.DS_Store

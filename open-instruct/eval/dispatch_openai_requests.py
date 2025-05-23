@@ -4,13 +4,9 @@ Thanks to Graham Neubig for sharing the original code.
 '''
 import asyncio
 from typing import Any, List, Dict
-from openai import AsyncOpenAI, OpenAIError
+from openai import AsyncOpenAI
 
-try:
-    aclient = AsyncOpenAI()
-except OpenAIError as e:
-    print(f"Error initializing OpenAI client: {e}")
-    print("If you are running an eval without OpenAI models, this is okay.")
+aclient = AsyncOpenAI()
 
 async def dispatch_openai_chat_requesets(
     messages_list: List[List[Dict[str,Any]]],

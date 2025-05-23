@@ -13,9 +13,7 @@ from eval.utils import (
     generate_completions,
     query_openai_chat_model,
     dynamic_import_function,
-    load_hf_tokenizer,
-    upload_results_to_hf,
-    check_and_upload_model_metadata
+    load_hf_tokenizer
 )
 
 
@@ -64,7 +62,6 @@ def main(args):
     if args.model_name_or_path:
         tokenizer = load_hf_tokenizer(
             model_name_or_path=args.model_name_or_path,
-            revision=args.hf_revision,
             tokenizer_name_or_path=args.tokenizer_name_or_path,
             use_fast_tokenizer=not args.use_slow_tokenizer,
         )
@@ -75,14 +72,11 @@ def main(args):
                 tokenizer=args.tokenizer_name_or_path if args.tokenizer_name_or_path else args.model_name_or_path,
                 tokenizer_mode="slow" if args.use_slow_tokenizer else "auto",
                 tensor_parallel_size=torch.cuda.device_count(),
-                tokenizer_revision=args.hf_revision,
-                revision=args.hf_revision,
             )
         else:
             print("Loading model and tokenizer with huggingface...")
             model = load_hf_lm(
                 model_name_or_path=args.model_name_or_path, 
-                revision=args.hf_revision,
                 load_in_8bit=args.load_in_8bit, 
                 device_map="balanced_low_0" if torch.cuda.device_count() > 1 else "auto",
                 gptq_model=args.gptq,
@@ -113,13 +107,10 @@ def main(args):
 
             # generate with vllm
             if args.use_vllm:
-                stop = args.additional_stop_sequence
-                if not args.use_chat_format or args.stop_at_double_newline:
-                    stop += ["\n\n"]
                 sampling_params = vllm.SamplingParams(
                     temperature=0,
                     max_tokens=512,
-                    stop=stop,
+                    stop=["\n\n"],
                 )
                 # We need to remap the outputs to the prompts because vllm might not return outputs for some prompts (e.g., if the prompt is too long)
                 generations = model.generate(prompts, sampling_params)
@@ -137,7 +128,7 @@ def main(args):
                     max_new_tokens=512,
                     temperature=0,
                     batch_size=args.eval_batch_size if args.eval_batch_size else 1,
-                    stop_id_sequences=[[stop_sequence] + [tokenizer.encode(stop, add_special_tokens=False) for stop in args.additional_stop_sequence]],
+                    stop_id_sequences=[[stop_sequence]],
                 )
         else:
             instances = []
@@ -184,23 +175,6 @@ def main(args):
         print(f"Average EM: {performance['average_exact_match']}")
         json.dump(performance, fout, indent=4)
 
-    if args.upload_to_hf is not None:
-        # upload metrics to HF. Main metric is the accuracy
-        results = performance
-        task_name = "oi_bbh_cot"
-        primary_score = results["average_exact_match"]
-        upload_results_to_hf(
-            results,
-            args.upload_to_hf,
-            args.hf_upload_name,
-            task_name=task_name,
-            primary_score=primary_score,
-            prepend_timestamp=True,
-        )
-        check_and_upload_model_metadata(
-            args.model_name_or_path, args.upload_to_hf, args.hf_upload_name, hf_revision=args.hf_revision
-        )
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -219,12 +193,6 @@ if __name__ == "__main__":
         type=str, 
         default=None, 
         help="if specified, we will load the model to generate the predictions."
-    )
-    parser.add_argument(
-        "--hf_revision",
-        type=str,
-        default=None,
-        help="if specified, we will load the model from a revision of the model in the hub"
     )
     parser.add_argument(
         "--tokenizer_name_or_path", 
@@ -285,31 +253,6 @@ if __name__ == "__main__":
         type=str, 
         default="eval.templates.create_prompt_with_tulu_chat_format", 
         help="The function to use to create the chat format. This function will be dynamically imported. Please see examples in `eval/templates.py`."
-    )
-    parser.add_argument(
-        '--additional_stop_sequence',
-        type=str,
-        nargs="+",
-        default=[],
-        help="Additional stop sequences to use when generating completions. Useful for e.g. llama-3-instruct."
-    )
-    parser.add_argument(
-        '--stop_at_double_newline',
-        action="store_true",
-        help="If given, we will stop generation at the first double newline. Turn on to match older eval settings."
-    )
-    parser.add_argument(
-        "--upload_to_hf",
-        type=str,
-        default=None,
-        help="If specified, we will upload the results to Hugging Face Datasets. "
-             "This should be the name of the dataset to upload to."
-    )
-    parser.add_argument(
-        "--hf_upload_name",
-        type=str,
-        default=None,
-        help="If uploading to hf, this is the model name"
     )
     args = parser.parse_args()
 

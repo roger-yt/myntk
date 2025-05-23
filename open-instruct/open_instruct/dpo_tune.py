@@ -1,15 +1,19 @@
 #!/usr/bin/env python
 # coding=utf-8
+'''
+DPO tuning script. Adapted from our finetuning script.
+'''
 
 import argparse
 import logging
 import math
 import os
 import random
+from copy import deepcopy
 import datasets
-from datetime import timedelta
 import torch
 from functools import partial
+from datetime import timedelta
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed, InitProcessGroupKwargs
@@ -17,7 +21,6 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import deepspeed
-
 import transformers
 from transformers import (
     AutoConfig,
@@ -26,7 +29,6 @@ from transformers import (
     LlamaTokenizer,
     LlamaTokenizerFast,
     SchedulerType,
-    DataCollatorForSeq2Seq,
     get_scheduler,
     GPTNeoXTokenizerFast,
     GPT2Tokenizer,
@@ -34,6 +36,7 @@ from transformers import (
     BitsAndBytesConfig,
 )
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+from dpo_utils import dpo_loss, concatenated_forward, DataCollatorForSeq2SeqDPO
 
 logger = get_logger(__name__)
 
@@ -41,6 +44,7 @@ try:
     from hf_olmo import OLMoTokenizerFast
 except ImportError:
     logger.warning("OLMo not installed. Ignore if using a different model.")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a causal language modeling task")
@@ -70,13 +74,6 @@ def parse_args():
         type=str,
         default=None,
         help="Pretrained config name or path if not the same as model_name",
-    )
-    parser.add_argument(
-        "--model_revision",
-        help="""If given, specifies a model revision (for HuggingFace models). This will 
-        be applied to both the `model_name_or_path` and `config_name` args.""",
-        default="main",
-        required=False,
     )
     parser.add_argument(
         "--use_lora",
@@ -111,15 +108,6 @@ def parse_args():
         type=str,
         default=None,
         help="Pretrained tokenizer name or path if not the same as model_name",
-    )
-    parser.add_argument(
-        "--tokenizer_revision",
-        help="""Specifies a revision for the tokenizer. If not given, defaults
-             to the value of the `model_revision` arg. In most cases, the tokenizer
-             revision should be the same as the model revision and this flag shouldn't
-             be needed.""",
-        default=None,
-        required=False,
     )
     parser.add_argument(
         "--use_slow_tokenizer",
@@ -169,7 +157,7 @@ def parse_args():
         "--warmup_ratio", type=float, default=0, help="Ratio of total training steps used for warmup."
     )
     parser.add_argument("--output_dir", type=str, default=None, help="Where to store the final model.")
-    parser.add_argument("--seed", type=int, default=42, help="A seed for reproducible training.")
+    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument(
         "--preprocessing_num_workers",
         type=int,
@@ -246,6 +234,17 @@ def parse_args():
         help='Use 8bit optimizer from bitsandbytes. Not compatible with deepspeed (use deepspeed config instead).',
     )
     parser.add_argument(
+        '--beta',
+        type=float,
+        default=0.1,
+        help='Beta parameter for DPO loss. Default is 0.1.',
+    )
+    parser.add_argument(
+        '--use_paged_optimizer',
+        action='store_true',
+        help='Use paged optimizer from bitsandbytes. Not compatible with deepspeed (use deepspeed config instead).',
+    )
+    parser.add_argument(
         '--add_bos',
         action='store_true',
         help='Forcibly add bos token to the beginning of the input sequence. Use only when tokenizer does not add bos token by default (e.g., olmo).',
@@ -261,12 +260,6 @@ def parse_args():
         action='store_true',
         help='Trust remote code when loading pretrained models and tokenizers. Use only when you trust the remote code.',
     )
-    parser.add_argument(
-        '--reduce_loss',
-        default='mean',
-        choices=['mean', 'sum'],
-        help='How to reduce loss over tokens. Default is mean, but using sum can improve chat model performance.',
-    )
     args = parser.parse_args()
 
     # Sanity checks
@@ -278,43 +271,19 @@ def parse_args():
             assert extension in ["json", "jsonl"], "`train_file` should be a json/jsonl file."
     return args
 
-
-def encode_with_prompt_completion_format(example, tokenizer, max_seq_length, add_bos=False):
-    '''
-    Here we assume each example has 'prompt' and 'completion' fields.
-    We concatenate prompt and completion and tokenize them together because otherwise prompt will be padded/trancated 
-    and it doesn't make sense to follow directly with the completion.
-    '''
-    # if prompt doesn't end with space and completion doesn't start with space, add space
-    if not example['prompt'].endswith((' ', '\n', '\t')) and not example['completion'].startswith((' ', '\n', '\t')):
-        example_text = example['prompt'] + ' ' + example['completion']
-    else:
-        example_text = example['prompt'] + example['completion']
-    example_text = example_text + tokenizer.eos_token
-    if add_bos:
-        example_text = tokenizer.bos_token + example_text
-    tokenized_example = tokenizer(example_text, return_tensors='pt', max_length=max_seq_length, truncation=True)
-    input_ids = tokenized_example.input_ids
-    labels = input_ids.clone()
-    tokenized_prompt = tokenizer(example['prompt'], return_tensors='pt', max_length=max_seq_length, truncation=True)
-    # mask the prompt part for avoiding loss
-    labels[:, :tokenized_prompt.input_ids.shape[1]] = -100
-    attention_mask = torch.ones_like(input_ids)
-    return {
-        'input_ids': input_ids.flatten(),
-        'labels': labels.flatten(),
-        'attention_mask': attention_mask.flatten(),
-    }
-
-
 def encode_with_messages_format(example, tokenizer, max_seq_length, add_bos=False):
     '''
-    Here we assume each example has a 'messages' field Each message is a dict with 'role' and 'content' fields.
+    Here we assume each example has a rejected and chosen field, both of which are a list of messages.
+    Each message is a dict with 'role' and 'content' fields.
     We concatenate all messages with the roles as delimiters and tokenize them together.
+    We assume only the last message is different, and the prompt is contained in the list of messages.
     '''
-    messages = example['messages']
-    if len(messages) == 0:
-        raise ValueError('messages field is empty.')
+    chosen_messages = example['chosen']
+    rejected_messages = example['rejected']
+    if len(chosen_messages) == 0:
+        raise ValueError('chosen messages field is empty.')
+    if len(rejected_messages) == 0:
+        raise ValueError('rejected messages field is empty.')
     
     def _concat_messages(messages):
         message_text = ""
@@ -329,43 +298,55 @@ def encode_with_messages_format(example, tokenizer, max_seq_length, add_bos=Fals
                 raise ValueError("Invalid role: {}".format(message["role"]))
         return message_text
         
-    example_text = _concat_messages(messages).strip()
-    if add_bos:
-        example_text = tokenizer.bos_token + example_text
-    tokenized_example = tokenizer(example_text, return_tensors='pt', max_length=max_seq_length, truncation=True)
-    input_ids = tokenized_example.input_ids
-    labels = input_ids.clone()
+    def encode_messages(messages):
+        example_text = _concat_messages(messages).strip()
+        if add_bos:
+            example_text = tokenizer.bos_token + example_text
+        tokenized_example = tokenizer(example_text, return_tensors='pt', max_length=max_seq_length, truncation=True)
+        input_ids = tokenized_example.input_ids
+        labels = input_ids.clone()
 
-    # mask the non-assistant part for avoiding loss
-    for message_idx, message in enumerate(messages):
-        if message["role"] != "assistant":
-            if message_idx == 0:
-                message_start_idx = 0
-            else:
-                message_start_idx = tokenizer(
-                    _concat_messages(messages[:message_idx]), return_tensors='pt', max_length=max_seq_length, truncation=True
+        # mask the non-assistant part for avoiding loss
+        for message_idx, message in enumerate(messages):
+            if message["role"] != "assistant":
+                if message_idx == 0:
+                    message_start_idx = 0
+                else:
+                    message_start_idx = tokenizer(
+                        _concat_messages(messages[:message_idx]), return_tensors='pt', max_length=max_seq_length, truncation=True
+                    ).input_ids.shape[1]
+                if message_idx < len(messages) - 1 and messages[message_idx+1]["role"] == "assistant":
+                    # here we also ignore the role of the assistant
+                    messages_so_far = _concat_messages(messages[:message_idx+1]) + "<|assistant|>\n"
+                else:
+                    messages_so_far = _concat_messages(messages[:message_idx+1])
+                message_end_idx = tokenizer(
+                    messages_so_far,
+                    return_tensors='pt', 
+                    max_length=max_seq_length, 
+                    truncation=True
                 ).input_ids.shape[1]
-            if message_idx < len(messages) - 1 and messages[message_idx+1]["role"] == "assistant":
-                # here we also ignore the role of the assistant
-                messages_so_far = _concat_messages(messages[:message_idx+1]) + "<|assistant|>\n"
-            else:
-                messages_so_far = _concat_messages(messages[:message_idx+1])
-            message_end_idx = tokenizer(
-                messages_so_far,
-                return_tensors='pt', 
-                max_length=max_seq_length, 
-                truncation=True
-            ).input_ids.shape[1]
-            labels[:, message_start_idx:message_end_idx] = -100
-            
-            if message_end_idx >= max_seq_length:
-                break
+                labels[:, message_start_idx:message_end_idx] = -100
+                
+                if message_end_idx >= max_seq_length:
+                    break
 
-    attention_mask = torch.ones_like(input_ids)
+        attention_mask = torch.ones_like(input_ids)
+        return {
+            'input_ids': input_ids.flatten(),
+            'labels': labels.flatten(),
+            'attention_mask': attention_mask.flatten(),
+        }
+    chosen_encoded = encode_messages(chosen_messages)
+    rejected_encoded = encode_messages(rejected_messages)
+    # labels are useful for working out where the loss is valid.
     return {
-        'input_ids': input_ids.flatten(),
-        'labels': labels.flatten(),
-        'attention_mask': attention_mask.flatten(),
+        'chosen_input_ids': chosen_encoded['input_ids'],
+        'chosen_labels': chosen_encoded['labels'],
+        'chosen_attention_mask': chosen_encoded['attention_mask'],
+        'rejected_input_ids': rejected_encoded['input_ids'],
+        'rejected_labels': rejected_encoded['labels'],
+        'rejected_attention_mask': rejected_encoded['attention_mask'],
     }
 
 
@@ -382,12 +363,41 @@ def save_with_accelerate(accelerator, model, tokenizer, output_dir, args):
         if accelerator.is_main_process:
             unwrapped_model.save_pretrained(output_dir, state_dict=state_dict)
     else:
-        # don't use safetensors for saving for now
         unwrapped_model.save_pretrained(
-            output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save, state_dict=state_dict,
-            safe_serialization=False
+            output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save, state_dict=state_dict, safe_serialization=False # errors with safetensors...
         )
 
+# from trl, we have to prep the ref model separately.
+def prepare_deepspeed(accelerator, model):
+        deepspeed_plugin = accelerator.state.deepspeed_plugin
+        config_kwargs = deepcopy(deepspeed_plugin.deepspeed_config)
+
+        if model is not None:
+            if hasattr(model, "config"):
+                hidden_size = (
+                    max(model.config.hidden_sizes)
+                    if getattr(model.config, "hidden_sizes", None)
+                    else getattr(model.config, "hidden_size", None)
+                )
+                if hidden_size is not None and config_kwargs["zero_optimization"]["stage"] == 3:
+                    # Note that `stage3_prefetch_bucket_size` can produce DeepSpeed messages like: `Invalidate trace cache @ step 0: expected module 1, but got module 0`
+                    # This is expected and is not an error, see: https://github.com/microsoft/DeepSpeed/discussions/4081
+                    config_kwargs.update(
+                        {
+                            "zero_optimization.reduce_bucket_size": hidden_size * hidden_size,
+                            "zero_optimization.stage3_param_persistence_threshold": 10 * hidden_size,
+                            "zero_optimization.stage3_prefetch_bucket_size": 0.9 * hidden_size * hidden_size,
+                        }
+                    )
+
+        # If ZeRO-3 is used, we shard both the active and reference model.
+        # Otherwise, we assume the reference model fits in memory and is initialized on each device with ZeRO disabled (stage 0)
+        if config_kwargs["zero_optimization"]["stage"] != 3:
+            config_kwargs["zero_optimization"]["stage"] = 0
+        model, *_ = deepspeed.initialize(model=model, config=config_kwargs)
+        model.eval()
+        return model
+        
 
 def main():
     args = parse_args()
@@ -443,7 +453,7 @@ def main():
         data_files = {}
         dataset_args = {}
         if args.train_file is not None:
-            data_files["train"] = args.train_file
+            data_files["train_prefs"] = args.train_file
         raw_datasets = load_dataset(
             "json",
             data_files=data_files,
@@ -452,90 +462,65 @@ def main():
 
     # Load pretrained model and tokenizer
     if args.config_name:
-        config = AutoConfig.from_pretrained(
-            args.config_name,
-            trust_remote_code=args.trust_remote_code,
-            revision=args.model_revision,
-        )
+        config = AutoConfig.from_pretrained(args.config_name, trust_remote_code=args.trust_remote_code)
     elif args.model_name_or_path:
-        config = AutoConfig.from_pretrained(
-            args.model_name_or_path,
-            trust_remote_code=args.trust_remote_code,
-            revision=args.model_revision,
-        )
+        config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=args.trust_remote_code)
     else:
         raise ValueError(
             "You are instantiating a new config instance from scratch. This is not supported by this script."
-        )
-
-    tokenizer_revision = (
-        args.model_revision
-        if args.tokenizer_revision is None
-        else args.tokenizer_revision
-    )
-
-    if tokenizer_revision != args.model_revision:
-        # Warn user if tokenizer and model use different revisions; this is an unusual
-        # use case.
-        warning = f"""Requested tokenizer revision `{tokenizer_revision}` is different
-                   from the model revision `{args.model_revision}`."""
-        logger.warn(warning)
+       )
 
     if args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.tokenizer_name,
-            trust_remote_code=args.trust_remote_code,
-            use_fast=not args.use_slow_tokenizer,
-            revision=tokenizer_revision
-        )
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, trust_remote_code=args.trust_remote_code)
     elif args.model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.model_name_or_path,
-            trust_remote_code=args.trust_remote_code,
-            use_fast=not args.use_slow_tokenizer,
-            revision=tokenizer_revision
-        )
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer, trust_remote_code=args.trust_remote_code)
     else:
         raise ValueError(
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
-
-    if args.model_name_or_path:
-        if args.use_qlora:
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16,
-            )
-            device_index = accelerator.local_process_index
-            device_map = {"": device_index} # force data-parallel training.
-            model = AutoModelForCausalLM.from_pretrained(
-                args.model_name_or_path,
-                from_tf=bool(".ckpt" in args.model_name_or_path),
-                config=config,
-                load_in_4bit=True,
-                quantization_config=bnb_config,
-                device_map=device_map,
-                trust_remote_code=args.trust_remote_code,
-                torch_dtype=torch.bfloat16,
-                use_flash_attention_2=True if args.use_flash_attn else False,
-                revision=args.model_revision
-            )
+    def load_model():
+        if args.model_name_or_path:
+            if args.use_qlora:
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                )
+                device_index = accelerator.local_process_index
+                device_map = {"": device_index} # force data-parallel training.
+                model = AutoModelForCausalLM.from_pretrained(
+                    args.model_name_or_path,
+                    from_tf=bool(".ckpt" in args.model_name_or_path),
+                    config=config,
+                    load_in_4bit=True,
+                    trust_remote_code=args.trust_remote_code,
+                    quantization_config=bnb_config,
+                    device_map=device_map,
+                    torch_dtype=torch.bfloat16,
+                    use_flash_attention_2=True if args.use_flash_attn else False,
+                )
+            else:
+                model = AutoModelForCausalLM.from_pretrained(
+                    args.model_name_or_path,
+                    from_tf=bool(".ckpt" in args.model_name_or_path),
+                    config=config,
+                    trust_remote_code=args.trust_remote_code,
+                    low_cpu_mem_usage=args.low_cpu_mem_usage,
+                    use_flash_attention_2=True if args.use_flash_attn else False,
+                )
         else:
-            model = AutoModelForCausalLM.from_pretrained(
-                args.model_name_or_path,
-                from_tf=bool(".ckpt" in args.model_name_or_path),
-                config=config,
-                trust_remote_code=args.trust_remote_code,
-                low_cpu_mem_usage=args.low_cpu_mem_usage,
-                use_flash_attention_2=True if args.use_flash_attn else False,
-                revision=args.model_revision
-            )
+            logger.info("Training new model from scratch")
+            model = AutoModelForCausalLM.from_config(config)
+        return model
+
+    model = load_model()
+    if not args.use_lora:
+        reference_model = load_model()
     else:
-        logger.info("Training new model from scratch")
-        model = AutoModelForCausalLM.from_config(config)
+        reference_model = model
+
 
     # no default pad token for llama!
     # here we add all special tokens again, because the default ones are not in the special_tokens_map
@@ -558,14 +543,12 @@ def main():
         # only the eos for olmo, but we use it as bos
         tokenizer.bos_token = tokenizer.eos_token
         assert args.add_bos, "For OLMo, you must add bos token to the beginning of the input sequence."
-    
 
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
     # gather deepspeed to get "real" embedding size    
     embeddings = model.get_input_embeddings()
     with deepspeed.zero.GatheredParameters(embeddings.weight, modifier_rank=None):
-        embedding_size = embeddings.weight.shape[0]
         if len(tokenizer) > embeddings.weight.shape[0]:
             model.resize_token_embeddings(len(tokenizer))
 
@@ -584,18 +567,11 @@ def main():
         )
         model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
-    elif args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
 
     # Preprocessing the datasets.
-    if "prompt" in raw_datasets["train"].column_names and "completion" in raw_datasets["train"].column_names:
-        encode_function = partial(
-            encode_with_prompt_completion_format,
-            tokenizer=tokenizer,
-            max_seq_length=args.max_seq_length,
-            add_bos=args.add_bos,
-        )
-    elif "messages" in raw_datasets["train"].column_names:
+    if "prompt" in raw_datasets["train_prefs"].column_names and "completion" in raw_datasets["train_prefs"].column_names:
+        raise ValueError("Sorry, prompt-completion format is not supported for DPO training.")
+    elif "chosen" in raw_datasets["train_prefs"].column_names and "rejected" in raw_datasets["train_prefs"].column_names:
         encode_function = partial(
             encode_with_messages_format,
             tokenizer=tokenizer,
@@ -603,21 +579,22 @@ def main():
             add_bos=args.add_bos,
         )
     else:
-        raise ValueError("You need to have either 'prompt'&'completion' or 'messages' in your column names.")
+        raise ValueError("You need to have 'chosen' and 'rejected in your column names.")
     
     with accelerator.main_process_first():
-        lm_datasets = raw_datasets.map(
+        lm_datasets = raw_datasets["train_prefs"].map(
             encode_function,
             batched=False,
             num_proc=args.preprocessing_num_workers,
-            load_from_cache_file=not args.overwrite_cache,
-            remove_columns=[name for name in raw_datasets["train"].column_names if name not in ["input_ids", "labels", "attention_mask"]],
+            remove_columns=[name for name in raw_datasets["train_prefs"].column_names if name not in ["chosen_input_ids", "chosen_labels", "chosen_attention_mask", "rejected_input_ids", "rejected_labels", "rejected_attention_mask"]],
             desc="Tokenizing and reformatting instruction data",
         )
         lm_datasets.set_format(type="pt")
-        lm_datasets = lm_datasets.filter(lambda example: (example['labels'] != -100).any())
+        # our thresholding mighta meant some examples have no labels, remove.
+        lm_datasets = lm_datasets.filter(lambda example: (example['chosen_labels'] != -100).any())
+        lm_datasets = lm_datasets.filter(lambda example: (example['rejected_labels'] != -100).any())
 
-    train_dataset = lm_datasets["train"]
+    train_dataset = lm_datasets
 
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_dataset)), 3):
@@ -627,7 +604,7 @@ def main():
     train_dataloader = DataLoader(
         train_dataset, 
         shuffle=True, 
-        collate_fn=DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest"),
+        collate_fn=DataCollatorForSeq2SeqDPO(tokenizer=tokenizer, model=model, padding="longest"),
         batch_size=args.per_device_train_batch_size
     )
 
@@ -644,7 +621,7 @@ def main():
             "weight_decay": 0.0,
         },
     ]
-    if args.use_qlora:
+    if args.use_qlora or args.use_paged_optimizer:
         from bitsandbytes.optim import AdamW
         optimizer = AdamW(
             optimizer_grouped_parameters,
@@ -681,6 +658,8 @@ def main():
     model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, lr_scheduler
     )
+    if not args.use_lora:
+        reference_model = prepare_deepspeed(accelerator, reference_model)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -704,7 +683,7 @@ def main():
 
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-
+    
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
@@ -769,30 +748,19 @@ def main():
         else:
             active_dataloader = train_dataloader
         for step, batch in enumerate(active_dataloader):
+            # dpo forward pass & loss
             with accelerator.accumulate(model):
-                outputs = model(**batch, use_cache=False)
-                if args.reduce_loss == 'mean':
-                    loss = outputs.loss
-                else:
-                    # reduce loss is sum
-                    # this ensures that we weight all tokens in the dataset equally,
-                    # rather than weighting each overall example equally when
-                    # using high amounts of gradient accumulation.
-                    # this can result in > 5 point improvements in AlpacaEval
-                    # see https://github.com/huggingface/transformers/issues/24725 for
-                    # more discussion and details.
-                    logits = outputs.logits
-                    labels = batch["labels"]
-                    # Shift so that tokens < n predict n
-                    shift_logits = logits[..., :-1, :].contiguous()
-                    shift_labels = labels[..., 1:].contiguous()
-                    # Flatten the tokens
-                    loss_fct = torch.nn.CrossEntropyLoss(reduction='sum')
-                    shift_logits = shift_logits.view(-1, embedding_size)
-                    shift_labels = shift_labels.view(-1)
-                    # Enable model parallelism
-                    shift_labels = shift_labels.to(shift_logits.device)
-                    loss = loss_fct(shift_logits, shift_labels)
+                policy_chosen_logps, policy_rejected_logps = concatenated_forward(model, batch)
+                with torch.no_grad():
+                    if args.use_lora:
+                        with accelerator.unwrap_model(model).disable_adapter():
+                            reference_chosen_logps, reference_rejected_logps = concatenated_forward(model, batch)
+                    else:
+                        reference_chosen_logps, reference_rejected_logps = concatenated_forward(reference_model, batch)
+                losses, _, _ = dpo_loss(
+                    policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps, beta=args.beta)
+                # TODO: metric logging          
+                loss = losses.mean()
                 # We keep track of the loss at each logged step
                 total_loss += loss.detach().float()
                 accelerator.backward(loss)
@@ -836,14 +804,14 @@ def main():
                 output_dir = os.path.join(args.output_dir, output_dir)
             save_with_accelerate(accelerator, model, tokenizer, output_dir, args)
 
+    if args.with_tracking:
+        accelerator.end_training()
+
     if args.output_dir is not None:
+        accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             tokenizer.save_pretrained(args.output_dir)
         save_with_accelerate(accelerator, model, tokenizer, args.output_dir, args)
-
-    accelerator.wait_for_everyone()
-    if args.with_tracking:
-        accelerator.end_training()
 
 
 if __name__ == "__main__":
