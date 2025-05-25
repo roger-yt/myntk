@@ -763,13 +763,14 @@ def main():
             engine.backward(scalar_i)
             # 3) collect full, de-sharded grads
             grads_i    = [
-                safe_get_full_grad(param).view(-1)
+                safe_get_full_grad(param).view(-1).cpu()
                 for _, param in engine.named_parameters()
                 if safe_get_full_grad(param) is not None
             ]
 
             # ---- compute each Theta[i, j] ----
             for j in range(N):
+                print("j=", j)
                 engine.zero_grad()
                 out_j_hs = backbone(
                     input_ids=X[j:j+1],
@@ -786,10 +787,13 @@ def main():
                     for _, param in engine.named_parameters()
                     if safe_get_full_grad(param) is not None
                 ]
+                # print("grads_j[0].device=", grads_j[0].device)
 
                 # incremental dot-product
-                dot_ij = sum((gi * gj).sum() for gi, gj in zip(grads_i, grads_j))
+                dot_ij = sum((gi.to(gj.device) * gj).sum() for gi, gj in zip(grads_i, grads_j))
                 Theta_local[out_idx, j] = dot_ij
+                del grads_j
+            del grads_i
 
 
 
