@@ -1,3 +1,5 @@
+export HF_TOKEN=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
+
 # check if there is $HF_TOKEN in the environment variables
 if [ -z "$HF_TOKEN" ]
 then

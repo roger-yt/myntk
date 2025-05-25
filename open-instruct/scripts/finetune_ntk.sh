@@ -15,13 +15,13 @@ accelerate launch \
     --num_processes $NUM_GPUS \
     --use_deepspeed \
     --deepspeed_config_file ds_configs/stage3_no_offloading_accelerate.conf \
-    open_instruct/finetune.py \
+    open_instruct/finetune_ntk.py \
     --model_name_or_path meta-llama/Llama-2-7b-chat-hf \
     --use_flash_attn \
     --tokenizer_name meta-llama/Llama-2-7b-chat-hf\
     --use_slow_tokenizer \
     --train_file data/processed/lima/lima_data.jsonl \
-    --max_seq_length 8192 \
+    --max_seq_length 2048 \
     --preprocessing_num_workers 128 \
     --per_device_train_batch_size $BATCH_SIZE_PER_GPU \
     --gradient_accumulation_steps $GRADIENT_ACC_STEPS \
@@ -34,4 +34,4 @@ accelerate launch \
     --with_tracking \
     --report_to tensorboard \
     --logging_steps 1 \
-    --use_lora
+    --use_ntk_regressio
