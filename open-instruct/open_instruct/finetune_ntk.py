@@ -745,7 +745,7 @@ def main():
         my_is       = list(range(rank, N, world_size))
         Theta_local = torch.zeros(len(my_is), N, device=engine.local_rank)
 
-        for out_idx, i in enumerate(my_is):
+        for out_idx, i in tqdm(enumerate(my_is)):
             # ---- compute vec_i ----
             engine.zero_grad()
             # 1) forward only through backbone + head for last token
@@ -769,7 +769,7 @@ def main():
             ]
 
             # ---- compute each Theta[i, j] ----
-            for j in range(N):
+            for j in tqdm(range(N)):
                 print("j=", j)
                 engine.zero_grad()
                 out_j_hs = backbone(
